@@ -1,25 +1,197 @@
 # @ideadesignmedia/gcal-mcp
 
-Private MCP server and CLI that links multiple Google Calendar accounts and exposes tools over stdio. Tokens are stored in SQLite. You can lock the database with a password so the server and all commands require a pass before use.
+Private MCP server (stdio) and CLI for linking and operating multiple Google Calendar accounts. It stores tokens in a local SQLite database and can encrypt refresh tokens at rest with a user password.
 
-## Install
+The server speaks MCP over stdio and keeps stdout clean (JSON‑RPC only); all human‑readable logs go to stderr.
+
+## Requirements
+
+- Node.js >= 18.17
+- A Google Cloud OAuth client (Web application) with Calendar API enabled
+  - You will need `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
+
+## One‑liner (npx)
+
+Use `npx` to run without installing globally. The package name is `@ideadesignmedia/gcal-mcp` and the binary is `gcal-mcp`.
 
 ```bash
-npm i -g @ideadesignmedia/gcal-mcp
-# or as npx on first run
-npx @ideadesignmedia/gcal-mcp --help
+# Help
+npx -y @ideadesignmedia/gcal-mcp --help
+
+# Link an account (opens browser by default)
+npx -y @ideadesignmedia/gcal-mcp add \
+  --client-id "$GOOGLE_CLIENT_ID" \
+  --client-secret "$GOOGLE_CLIENT_SECRET"
+
+# Lock the database (encrypts existing refresh tokens)
+npx -y @ideadesignmedia/gcal-mcp passwd --pass 'your-strong-pass'
+
+# Start the MCP server over stdio (stdout is JSON only)
+GMAIL_MCP_DB_PASS='your-strong-pass' \
+  npx -y @ideadesignmedia/gcal-mcp start
 ```
 
-## Quick start
+## Database
 
-```bash
-# Link an account
-gcal-mcp add --client-id $GOOGLE_CLIENT_ID --client-secret $GOOGLE_CLIENT_SECRET
+- Default location: `~/.idm/gcal-mcp/db.sqlite`
+- Override with `--db <path>` on any command
+- When locked, refresh tokens are encrypted with AES‑GCM using a DEK derived from your password via scrypt
 
-# Lock the DB
-gcal-mcp passwd --pass 'your-strong-pass'
+## Global Flags
 
-# Start the MCP server
-export GMAIL_MCP_DB_PASS='your-strong-pass'
-gcal-mcp start
+- `--db <path>`: SQLite database path (defaults above)
+- `--pass <pass>`: Database password (where applicable). For `start`, consider `GMAIL_MCP_DB_PASS` instead.
+- `--read-only`: Start server with write tools disabled (create/update/delete)
+
+Environment variables:
+
+- `GMAIL_MCP_DB_PASS`: Password used by `start` (and as a fallback elsewhere)
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`: OAuth credentials (used by `add` if flags not supplied)
+
+## Commands
+
+- `start`
+  - Starts the MCP server over stdio
+  - Respects `--read-only`
+  - Stdout: JSON‑RPC messages only; logs to stderr
+  - Examples:
+    - `GMAIL_MCP_DB_PASS='...' npx -y @ideadesignmedia/gcal-mcp start`
+
+- `add`
+  - Links a Google account and stores its refresh token
+  - Options:
+    - `--client-id <id>` / `--client-secret <secret>` (or use env vars)
+    - `--device` for Device Code flow (headless), otherwise opens a browser on loopback (default port 43112; change with `--listen-port <port>`)
+  - Example:
+    - `npx -y @ideadesignmedia/gcal-mcp add --client-id $GOOGLE_CLIENT_ID --client-secret $GOOGLE_CLIENT_SECRET`
+
+- `list`
+  - Lists linked accounts (id, email, display name, created)
+
+- `remove <key>`
+  - Removes an account and its tokens by id or email
+
+- `passwd`
+  - Locks the database or rotates an existing password
+  - Options:
+    - `--pass <pass>`: Password to set when locking, or new password when rotating
+    - `--rotate`: Rotate the existing password (requires `--old-pass`)
+    - `--old-pass <old>`: Old password for rotation
+    - `--hint <text>`: Optional password hint stored alongside the KDF parameters
+
+## MCP Server Integration
+
+Any MCP‑capable client can launch this server as a stdio process. A generic config entry looks like:
+
+```json
+{
+  "mcpServers": {
+    "gcal-mcp": {
+      "command": "npx",
+      "args": ["-y", "@ideadesignmedia/gcal-mcp", "start"],
+      "env": {
+        "GMAIL_MCP_DB_PASS": "${secret:GCAL_DB_PASS}",
+        "GOOGLE_CLIENT_ID": "${env:GOOGLE_CLIENT_ID}",
+        "GOOGLE_CLIENT_SECRET": "${env:GOOGLE_CLIENT_SECRET}"
+      }
+    }
+  }
+}
 ```
+
+Notes:
+
+- The `start` command writes only JSON‑RPC to stdout as required by MCP stdio.
+- Use your client’s secret storage for `GMAIL_MCP_DB_PASS` where available.
+
+## Provided Tools
+
+The server exposes the following tools. Names and parameter schemas follow the Chat Completions function tool shape.
+
+- `list_accounts`
+  - Parameters: none
+  - Returns: `{ accounts: Array<{ id: string, email: string, displayName: string | null }> }`
+
+- `list_calendars`
+  - Parameters:
+    - `account` (string; id or email)
+  - Returns: `{ calendars: Array<{ id: string | null, summary: string | null, primary: boolean }> }`
+
+- `search_events`
+  - Parameters:
+    - `account` (string)
+    - `calendarId` (string, optional; defaults to `primary`)
+    - `q` (string, optional)
+    - `timeMin` (ISO string, optional)
+    - `timeMax` (ISO string, optional)
+    - `maxResults` (integer 1..250, optional)
+  - Returns: `{ events: GoogleCalendarEvent[] }` (verbatim event objects)
+
+- `get_event`
+  - Parameters:
+    - `account` (string)
+    - `calendarId` (string)
+    - `eventId` (string)
+  - Returns: `GoogleCalendarEvent`
+
+- `create_event`
+  - Parameters:
+    - `account` (string)
+    - `calendarId` (string)
+    - `summary` (string)
+    - `description` (string, optional)
+    - `location` (string, optional)
+    - `start` (object: `{ dateTime?: string, date?: string, timeZone?: string }`)
+    - `end` (object: `{ dateTime?: string, date?: string, timeZone?: string }`)
+    - `attendees` (array of `{ email: string }`, optional)
+  - Returns: `GoogleCalendarEvent`
+
+- `update_event`
+  - Parameters:
+    - `account` (string)
+    - `calendarId` (string)
+    - `eventId` (string)
+    - `patch` (object; partial event resource)
+  - Returns: `GoogleCalendarEvent`
+
+- `delete_event`
+  - Parameters:
+    - `account` (string)
+    - `calendarId` (string)
+    - `eventId` (string)
+  - Returns: `{ ok: true }` on success
+
+Read‑only mode:
+
+- Start with `--read-only` to disable `create_event`, `update_event`, and `delete_event`.
+
+## OAuth Flows
+
+- Default: Loopback flow. The CLI opens your browser to grant access and listens on `127.0.0.1:43112` for the redirect (customizable via `--listen-port`).
+- Headless: Device Code flow with `--device`. The CLI prints a code and verification URL to the terminal.
+- Scopes used: `https://www.googleapis.com/auth/calendar`, plus `openid email profile` to capture account identity.
+
+## Security Notes
+
+- When locked, refresh tokens are encrypted at rest (AES‑GCM). The key is derived with scrypt using per‑DB salt and stored KDF parameters.
+- The MCP `start` command emits no human‑readable output on stdout.
+- Prefer setting `GMAIL_MCP_DB_PASS` via your MCP client’s secret system; avoid committing secrets in configs.
+
+## Troubleshooting
+
+- Database is locked
+  - Set `GMAIL_MCP_DB_PASS` or pass `--pass` when needed. For `start`, use the env var.
+
+- OAuth did not return a refresh_token
+  - Ensure you used the provided `add` command (it requests offline access with consent). If you previously granted access without offline permission, remove prior consent in your Google Account or create a new OAuth client.
+
+- Loopback callback failed
+  - Check firewall or try `--device` for Device Code flow.
+
+- MCP client shows parse errors
+  - Verify you are launching the server with `start` and not another command. STDOUT must remain clean JSON‑RPC.
+
+---
+
+MIT © Idea Design Media
+
