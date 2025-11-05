@@ -1,6 +1,5 @@
 import http from 'http';
 import { URL } from 'url';
-import open from 'open';
 import { google } from 'googleapis';
 type AddOptions = { clientId: string; clientSecret: string; device?: boolean; scopes: string[]; listenPort?: number; };
 export type OAuthResult = { access_token: string; refresh_token: string; expires_in?: number; id_token?: string; token_type?: string; };
@@ -20,7 +19,26 @@ async function loopbackFlow(opts: AddOptions): Promise<OAuthResult> {
         server.close(); if (c) resolve(c); else reject(new Error('Missing code'));
       } else { res.statusCode = 404; res.end('Not found'); }
     });
-    server.listen(port, '127.0.0.1', () => { open(url).catch(() => { console.error('Open browser failed. Visit this URL manually:'); console.error(url); }); });
+    server.on('error', (err) => {
+      console.error(`OAuth loopback server error: ${String((err as any)?.message || err)}`);
+      console.error(`If the port ${port} is in use, retry with --listen-port <free-port> or use --device.`);
+      reject(err);
+    });
+    server.listen(port, '127.0.0.1', () => {
+      // Always print the URL for manual copy/paste.
+      console.error('Authorize in your browser by visiting this URL:');
+      console.error(url);
+    });
+    // Helpful reminder if user forgets to complete the flow
+    const reminder = setTimeout(() => {
+      try {
+        console.error('Still waiting for OAuth callback...');
+        console.error('If stuck, try --device for headless auth or use --listen-port <port> and whitelist the redirect.');
+        console.error(url);
+      } catch {}
+    }, 120_000);
+    const cleanup = () => { try { clearTimeout(reminder); } catch {} };
+    server.on('close', cleanup);
   });
   const { tokens } = await oauth2Client.getToken(code);
   if (!tokens.refresh_token) throw new Error('No refresh_token returned.');

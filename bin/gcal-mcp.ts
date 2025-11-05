@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { openDb, pragmas, migrate, run, tx } from '../src/db';
+import { openDb, pragmas, migrate, run, tx, all } from '../src/db';
 import { resolveDb, resolvePass } from '../src/config';
 import { isLocked, tryUnwrapDek, lockDatabase, rotatePassword } from '../src/keystore';
 import { oauthAddFlow } from '../src/oauth';
@@ -44,6 +44,8 @@ program
   .option('--client-id <id>', 'Google OAuth client id')
   .option('--client-secret <secret>', 'Google OAuth client secret')
   .option('--device', 'Use device code flow', false)
+  .option('--scopes <list>', 'Comma or space-separated OAuth scopes (overrides defaults)')
+  .option('--choose-scopes', 'Interactive scope selection when --scopes is not supplied', false)
   .option('--listen-port <port>', 'Loopback port', (v) => parseInt(v, 10), 43112)
   .action(async (opts) => {
     const flags = program.opts<{ db?: string; pass?: string }>();
@@ -65,7 +67,35 @@ program
     const clientSecret = opts.clientSecret || process.env.GOOGLE_CLIENT_SECRET;
     if (!clientId || !clientSecret) { console.error('Missing --client-id/--client-secret or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET.'); process.exit(2); }
 
-    const scopes = ['https://www.googleapis.com/auth/calendar', 'openid', 'email', 'profile'];
+    let scopes: string[] | undefined;
+    if (opts.scopes && String(opts.scopes).trim().length > 0) {
+      scopes = String(opts.scopes)
+        .split(/[\s,]+/)
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+    } else if (opts.chooseScopes) {
+      const { createInterface } = await import('node:readline/promises');
+      const { stdin, stderr } = await import('node:process');
+      const rl = createInterface({ input: stdin, output: stderr });
+      try {
+        console.error('Select Calendar access level:');
+        console.error('  [1] Read-only (https://www.googleapis.com/auth/calendar.readonly)');
+        console.error('  [2] Read/Write (https://www.googleapis.com/auth/calendar)');
+        const choice = (await rl.question('Enter 1 or 2: ')).trim();
+        const base = choice === '1'
+          ? ['https://www.googleapis.com/auth/calendar.readonly']
+          : ['https://www.googleapis.com/auth/calendar'];
+        const extraRaw = (await rl.question('Extra scopes? (comma-separated or blank): ')).trim();
+        const extra = extraRaw.length ? extraRaw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean) : [];
+        // Always include identity scopes so we can identify the account.
+        scopes = [...base, 'openid', 'email', 'profile', ...extra];
+      } finally {
+        rl.close();
+      }
+    } else {
+      scopes = ['https://www.googleapis.com/auth/calendar', 'openid', 'email', 'profile'];
+    }
+
     const tokens = await oauthAddFlow({ clientId, clientSecret, device: !!opts.device, scopes, listenPort: opts.listenPort });
 
     const oauth2 = google.oauth2('v2');
@@ -114,7 +144,7 @@ program
       try { await tryUnwrapDek(db, pass); } catch { console.error('Password is incorrect or database is corrupt.'); process.exit(11); }
     }
 
-    const rows = await new Promise<any[]>((res, rej) => (db as any).all('SELECT id,email,display_name,created_at FROM accounts ORDER BY email', [], (e: any, r: any[]) => e ? rej(e) : res(r)));
+    const rows = await all<any>(db, 'SELECT id,email,display_name,created_at FROM accounts ORDER BY email', []);
     for (const r of rows) {
       const created = new Date(r.created_at).toISOString();
       console.log(`${r.id}	${r.email}	${r.display_name || ''}	${created}`);

@@ -18,7 +18,7 @@ Use `npx` to run without installing globally. The package name is `@ideadesignme
 # Help
 npx -y @ideadesignmedia/gcal-mcp --help
 
-# Link an account (opens browser by default)
+# Link an account (prints an authorization URL)
 npx -y @ideadesignmedia/gcal-mcp add \
   --client-id "$GOOGLE_CLIENT_ID" \
   --client-secret "$GOOGLE_CLIENT_SECRET"
@@ -61,9 +61,12 @@ Environment variables:
   - Links a Google account and stores its refresh token
   - Options:
     - `--client-id <id>` / `--client-secret <secret>` (or use env vars)
-    - `--device` for Device Code flow (headless), otherwise opens a browser on loopback (default port 43112; change with `--listen-port <port>`)
+    - `--device` for Device Code flow (headless), otherwise uses loopback redirect and prints a URL to visit (default port 43112; change with `--listen-port <port>`)
+    - `--scopes <list>` to provide custom scopes (comma or space separated)
+    - `--choose-scopes` to interactively select calendar access (read-only vs read/write) and optionally add extra scopes
   - Example:
     - `npx -y @ideadesignmedia/gcal-mcp add --client-id $GOOGLE_CLIENT_ID --client-secret $GOOGLE_CLIENT_SECRET`
+    - `npx -y @ideadesignmedia/gcal-mcp add --choose-scopes --client-id $GOOGLE_CLIENT_ID --client-secret $GOOGLE_CLIENT_SECRET`
 
 - `list`
   - Lists linked accounts (id, email, display name, created)
@@ -108,36 +111,45 @@ Notes:
 
 The server exposes the following tools. Names and parameter schemas follow the Chat Completions function tool shape.
 
-- `list_accounts`
+Primary calendar only:
+
+- All operations target the account’s primary calendar automatically; there is no `calendarId` parameter.
+  - This removes confusion between account vs calendar. The server passes `primary` internally.
+
+Account resolution rules (applies wherever `account` is accepted):
+
+- Accepts exact `email` or `id`.
+- Also accepts a partial, case-insensitive match on email or display name.
+- If `account` is omitted and exactly one account is linked, that account is used.
+- If multiple accounts would match or are linked with no `account` provided, the tool throws a helpful error. Use `gcal-list_accounts` to choose deterministically.
+
+- `gcal-list_accounts`
   - Parameters: none
   - Returns: `{ accounts: Array<{ id: string, email: string, displayName: string | null }> }`
 
-- `list_calendars`
+- `gcal-resolve_account`
   - Parameters:
-    - `account` (string; id or email)
-  - Returns: `{ calendars: Array<{ id: string | null, summary: string | null, primary: boolean }> }`
+    - `query` (string; optional; email/id or partial). If omitted or blank, returns all accounts.
+  - Returns: `{ query: string, matches: Array<{ id: string, email: string, displayName: string | null }>, exact: boolean, ambiguous: boolean, count: number }`
 
-- `search_events`
+- `gcal-search_events`
   - Parameters:
-    - `account` (string)
-    - `calendarId` (string, optional; defaults to `primary`)
+    - `account` (string; optional)
     - `q` (string, optional)
     - `timeMin` (ISO string, optional)
     - `timeMax` (ISO string, optional)
     - `maxResults` (integer 1..250, optional)
   - Returns: `{ events: GoogleCalendarEvent[] }` (verbatim event objects)
 
-- `get_event`
+- `gcal-get_event`
   - Parameters:
-    - `account` (string)
-    - `calendarId` (string)
+    - `account` (string; optional)
     - `eventId` (string)
   - Returns: `GoogleCalendarEvent`
 
-- `create_event`
+- `gcal-create_event`
   - Parameters:
-    - `account` (string)
-    - `calendarId` (string)
+    - `account` (string; optional)
     - `summary` (string)
     - `description` (string, optional)
     - `location` (string, optional)
@@ -146,24 +158,22 @@ The server exposes the following tools. Names and parameter schemas follow the C
     - `attendees` (array of `{ email: string }`, optional)
   - Returns: `GoogleCalendarEvent`
 
-- `update_event`
+- `gcal-update_event`
   - Parameters:
-    - `account` (string)
-    - `calendarId` (string)
+    - `account` (string; optional)
     - `eventId` (string)
     - `patch` (object; partial event resource)
   - Returns: `GoogleCalendarEvent`
 
-- `delete_event`
+- `gcal-delete_event`
   - Parameters:
-    - `account` (string)
-    - `calendarId` (string)
+    - `account` (string; optional)
     - `eventId` (string)
   - Returns: `{ ok: true }` on success
 
 Read‑only mode:
 
-- Start with `--read-only` to disable `create_event`, `update_event`, and `delete_event`.
+- Start with `--read-only` to disable `gcal-create_event`, `gcal-update_event`, and `gcal-delete_event`.
 
 ## OAuth Flows
 
@@ -194,4 +204,3 @@ Read‑only mode:
 ---
 
 MIT © Idea Design Media
-

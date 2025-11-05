@@ -1,7 +1,9 @@
 
-import { DB, get, run, tx } from './db';
+import { DB, get, run, tx, all } from './db';
 import { KdfParams, deriveKek, randomBytes, encryptAesGcm, decryptAesGcm } from './crypto';
-const DEFAULT_KDF: KdfParams = { N: 32768, r: 8, p: 1, dkLen: 32 };
+// Default scrypt work factor chosen to avoid default OpenSSL 32MiB cap in common environments.
+// Memory ≈ 128 * N * r = 16 MiB here. We still raise maxmem dynamically during derivation.
+const DEFAULT_KDF: KdfParams = { N: 16384, r: 8, p: 1, dkLen: 32 };
 export type UnwrappedDek = { dek: Buffer, params: KdfParams, salt: Buffer };
 export async function isLocked(db: DB): Promise<boolean> {
   const row = await get<{ is_locked: number }>(db, 'SELECT is_locked FROM encryption_meta WHERE id=1');
@@ -27,9 +29,10 @@ export async function lockDatabase(db: DB, password: string, hint?: string) {
     await run(db, 'UPDATE encryption_meta SET is_locked=1,kdf_salt=?,kdf_params_json=?,dek_ct=?,dek_iv=?,dek_tag=?,password_hint=? WHERE id=1',
       [salt, JSON.stringify(params), dek_ct, dek_iv, dek_tag, hint || null]);
   });
-  const rows: Array<{ account_id: string, refresh_token: string | null }> = await new Promise((res, rej) => {
-    (db as any).all('SELECT account_id, refresh_token FROM credentials WHERE refresh_token IS NOT NULL', [], (err: any, rows: any[]) => err ? rej(err) : res(rows));
-  });
+  const rows = await all<{ account_id: string, refresh_token: string | null }>(db,
+    'SELECT account_id, refresh_token FROM credentials WHERE refresh_token IS NOT NULL',
+    []
+  );
   const em = await get<any>(db, 'SELECT * FROM encryption_meta WHERE id=1');
   if (!em) throw new Error('encryption_meta missing after lock');
   const params: KdfParams = em.kdf_params_json ? JSON.parse(em.kdf_params_json) : DEFAULT_KDF;

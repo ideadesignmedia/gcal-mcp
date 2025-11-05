@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { ChatToolParametersSchema, JsonValue, McpToolHandlerOptions } from '@ideadesignmedia/open-ai.js';
 import { DB } from './db';
-import { CalendarConfig, listAccounts, getAccountByKey, listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent } from './calendar';
+import { CalendarConfig, listAccounts, resolveAccount, searchAccounts, listEvents, getEvent, createEvent, updateEvent, deleteEvent } from './calendar';
 
 const emptyParams = {
   type: 'object',
@@ -9,22 +9,19 @@ const emptyParams = {
   additionalProperties: false
 } as const satisfies ChatToolParametersSchema;
 
-const listCalendarsParams = {
+const resolveAccountParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account'],
   properties: {
-    account: { type: 'string', description: 'Account email or id' }
+    query: { type: 'string', description: 'Email, id, or partial (case-insensitive). If omitted or blank, returns all accounts.' }
   }
 } as const satisfies ChatToolParametersSchema;
 
 const searchEventsParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account'],
   properties: {
-    account: { type: 'string' },
-    calendarId: { type: 'string' },
+    account: { type: 'string', description: 'Account identifier (email, id, or partial). Optional when only one linked account exists.' },
     q: { type: 'string' },
     timeMin: { type: 'string' },
     timeMax: { type: 'string' },
@@ -35,10 +32,9 @@ const searchEventsParams = {
 const getEventParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account', 'calendarId', 'eventId'],
+  required: ['eventId'],
   properties: {
-    account: { type: 'string' },
-    calendarId: { type: 'string' },
+    account: { type: 'string', description: 'Account identifier (email, id, or partial). Optional when only one linked account exists.' },
     eventId: { type: 'string' }
   }
 } as const satisfies ChatToolParametersSchema;
@@ -46,10 +42,9 @@ const getEventParams = {
 const createEventParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account', 'calendarId', 'summary', 'start', 'end'],
+  required: ['summary', 'start', 'end'],
   properties: {
-    account: { type: 'string' },
-    calendarId: { type: 'string' },
+    account: { type: 'string', description: 'Account identifier (email, id, or partial). Optional when only one linked account exists.' },
     summary: { type: 'string' },
     description: { type: 'string' },
     location: { type: 'string' },
@@ -88,10 +83,9 @@ const createEventParams = {
 const updateEventParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account', 'calendarId', 'eventId', 'patch'],
+  required: ['eventId', 'patch'],
   properties: {
-    account: { type: 'string' },
-    calendarId: { type: 'string' },
+    account: { type: 'string', description: 'Account identifier (email, id, or partial). Optional when only one linked account exists.' },
     eventId: { type: 'string' },
     patch: { type: 'object' }
   }
@@ -100,27 +94,24 @@ const updateEventParams = {
 const deleteEventParams = {
   type: 'object',
   additionalProperties: false,
-  required: ['account', 'calendarId', 'eventId'],
+  required: ['eventId'],
   properties: {
-    account: { type: 'string' },
-    calendarId: { type: 'string' },
+    account: { type: 'string', description: 'Account identifier (email, id, or partial). Optional when only one linked account exists.' },
     eventId: { type: 'string' }
   }
 } as const satisfies ChatToolParametersSchema;
 
-const listCalendarsSchema = z.object({ account: z.string() });
+// No calendar listing; operations target the primary calendar automatically
 const searchEventsSchema = z.object({
-  account: z.string(),
-  calendarId: z.string().optional(),
+  account: z.string().optional(),
   q: z.string().optional(),
   timeMin: z.string().optional(),
   timeMax: z.string().optional(),
   maxResults: z.number().int().min(1).max(250).optional()
 });
-const getEventSchema = z.object({ account: z.string(), calendarId: z.string(), eventId: z.string() });
+const getEventSchema = z.object({ account: z.string().optional(), eventId: z.string() });
 const createEventSchema = z.object({
-  account: z.string(),
-  calendarId: z.string(),
+  account: z.string().optional(),
   summary: z.string(),
   description: z.string().optional(),
   location: z.string().optional(),
@@ -137,12 +128,11 @@ const createEventSchema = z.object({
   attendees: z.array(z.object({ email: z.string() })).optional()
 });
 const updateEventSchema = z.object({
-  account: z.string(),
-  calendarId: z.string(),
+  account: z.string().optional(),
   eventId: z.string(),
   patch: z.record(z.any())
 });
-const deleteEventSchema = z.object({ account: z.string(), calendarId: z.string(), eventId: z.string() });
+const deleteEventSchema = z.object({ account: z.string().optional(), eventId: z.string() });
 
 export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): McpToolHandlerOptions[] {
   const cfg: CalendarConfig = { db, dek, readOnly };
@@ -152,8 +142,8 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'list_accounts',
-          description: 'List linked Google Calendar accounts',
+          name: 'gcal-list_accounts',
+          description: 'List linked Google Calendar accounts you can operate on. Use this to get a valid `account` identifier (email or id).',
           parameters: emptyParams
         }
       },
@@ -171,39 +161,45 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'list_calendars',
-          description: 'List calendars for an account',
-          parameters: listCalendarsParams
+          name: 'gcal-resolve_account',
+          description: 'Resolve an account identifier to candidates without throwing. Accepts email, id, or partial. Returns matches and whether the match is exact or ambiguous.',
+          parameters: resolveAccountParams
         }
       },
       handler: async (args) => {
-        const input = listCalendarsSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
-        const items = await listCalendars(cfg, acc.id);
-        const calendars = (items || []).map(c => ({
-          id: c.id ?? null,
-          summary: c.summary ?? null,
-          primary: !!c.primary
-        }));
-        return { calendars } as JsonValue;
+        const input = z.object({ query: z.string().optional() }).parse(args);
+        const q = (input.query ?? '').trim();
+        // Try exact match first when provided
+        if (q) {
+          const exact = await (async () => {
+            const rows = await searchAccounts(db, q);
+            // Check for exact by id/email
+            const exactByEmailOrId = rows.find(r => r.email === q || r.id === q);
+            return exactByEmailOrId ? [exactByEmailOrId] : [];
+          })();
+          if (exact.length === 1) {
+            const matches = exact.map(r => ({ id: r.id, email: r.email, displayName: r.display_name ?? null }));
+            return { query: q, matches, exact: true, ambiguous: false, count: matches.length } as JsonValue;
+          }
+        }
+        const rows = await searchAccounts(db, q);
+        const matches = rows.map(r => ({ id: r.id, email: r.email, displayName: r.display_name ?? null }));
+        return { query: q, matches, exact: false, ambiguous: matches.length > 1, count: matches.length } as JsonValue;
       }
     },
     {
       tool: {
         type: 'function',
         function: {
-          name: 'search_events',
-          description: 'Search events by query and/or time window',
+          name: 'gcal-search_events',
+          description: 'Search events by query and/or time window on the primary calendar of a linked account. If `account` is omitted and only one account is linked, it will be used. Otherwise, call `gcal-list_accounts` to choose.',
           parameters: searchEventsParams
         }
       },
       handler: async (args) => {
         const input = searchEventsSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
-        const calId = input.calendarId || 'primary';
-        const items = await listEvents(cfg, acc.id, calId, {
+        const acc = await resolveAccount(db, input.account);
+        const items = await listEvents(cfg, acc.id, 'primary', {
           q: input.q,
           timeMin: input.timeMin,
           timeMax: input.timeMax,
@@ -217,16 +213,15 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'get_event',
-          description: 'Get a single event',
+          name: 'gcal-get_event',
+          description: 'Get a single event from the primary calendar of a linked account. `account` may be email, id, or partial (optional when only one account exists).',
           parameters: getEventParams
         }
       },
       handler: async (args) => {
         const input = getEventSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
-        const event = await getEvent(cfg, acc.id, input.calendarId, input.eventId);
+        const acc = await resolveAccount(db, input.account);
+        const event = await getEvent(cfg, acc.id, 'primary', input.eventId);
         return event as unknown as JsonValue;
       }
     },
@@ -234,15 +229,14 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'create_event',
-          description: 'Create an event',
+          name: 'gcal-create_event',
+          description: 'Create an event on the primary calendar of a linked account. If unsure which account to use, call `gcal-list_accounts`. `account` accepts email, id, or a partial match.',
           parameters: createEventParams
         }
       },
       handler: async (args) => {
         const input = createEventSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
+        const acc = await resolveAccount(db, input.account);
         const event = {
           summary: input.summary,
           description: input.description,
@@ -251,7 +245,7 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
           end: input.end,
           attendees: input.attendees
         };
-        const created = await createEvent(cfg, acc.id, input.calendarId, event);
+        const created = await createEvent(cfg, acc.id, 'primary', event);
         return created as unknown as JsonValue;
       }
     },
@@ -259,16 +253,15 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'update_event',
-          description: 'Update an event (patch)',
+          name: 'gcal-update_event',
+          description: 'Update an event (patch) on the primary calendar of a linked account. `account` accepts email, id, or partial (optional when only one account exists).',
           parameters: updateEventParams
         }
       },
       handler: async (args) => {
         const input = updateEventSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
-        const updated = await updateEvent(cfg, acc.id, input.calendarId, input.eventId, input.patch || {});
+        const acc = await resolveAccount(db, input.account);
+        const updated = await updateEvent(cfg, acc.id, 'primary', input.eventId, input.patch || {});
         return updated as unknown as JsonValue;
       }
     },
@@ -276,16 +269,15 @@ export function buildTools(db: DB, dek: Buffer | undefined, readOnly = false): M
       tool: {
         type: 'function',
         function: {
-          name: 'delete_event',
-          description: 'Delete an event',
+          name: 'gcal-delete_event',
+          description: 'Delete an event from the primary calendar of a linked account. `account` accepts email, id, or partial (optional when only one account exists).',
           parameters: deleteEventParams
         }
       },
       handler: async (args) => {
         const input = deleteEventSchema.parse(args);
-        const acc = await getAccountByKey(db, input.account);
-        if (!acc) throw new Error('Account not found');
-        const result = await deleteEvent(cfg, acc.id, input.calendarId, input.eventId);
+        const acc = await resolveAccount(db, input.account);
+        const result = await deleteEvent(cfg, acc.id, 'primary', input.eventId);
         return result as JsonValue;
       }
     }
